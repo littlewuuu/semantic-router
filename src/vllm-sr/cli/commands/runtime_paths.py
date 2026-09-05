@@ -316,7 +316,39 @@ def read_private_state_bytes(path: Path) -> bytes | None:
 
     Hardening is unconditional, so this must not be used on a file written with
     a relaxed ``mode`` for a container to read: reading it back would revoke the
-    access the relaxed mode exists to grant.
+    access the relaxed mode exists to grant. Use
+    :func:`read_container_readable_state_bytes` for those files instead.
+    """
+
+    return _read_state_file_bytes(path, harden_permissions=True)
+
+
+def read_container_readable_state_bytes(path: Path) -> bytes | None:
+    """Read one container-readable runtime-state file without revoking its mode.
+
+    The owner-only reader above must not be used here: it unconditionally
+    restores ``PRIVATE_STATE_FILE_MODE``, which would revoke exactly the read
+    access a ``CONTAINER_READABLE_STATE_FILE_MODE`` file grants an unprivileged
+    container uid after bind mount. This reader runs the same shape, size, and
+    ownership checks but leaves the permission bits alone, so a CLI that reads
+    back a mounted secret it wrote does not break the container that mounts it.
+
+    A missing file returns ``None``. A mode outside the two this module ever
+    writes is a hard error: no safe in-place repair exists for an unexpected
+    permission bit, and silently tolerating one would hide a file another
+    process made world-writable.
+    """
+
+    return _read_state_file_bytes(path, harden_permissions=False)
+
+
+def _read_state_file_bytes(path: Path, *, harden_permissions: bool) -> bytes | None:
+    """Open one validated runtime-state file, optionally hardening its mode.
+
+    *harden_permissions* selects the caller's contract: ``True`` restores the
+    owner-only mode (drift repair), ``False`` rejects any mode the module never
+    wrote. Directory privacy, direct-child placement, symlink refusal,
+    regular-file shape, size, and ownership are shared by both readers.
     """
 
     path = path.expanduser().absolute()
@@ -343,7 +375,10 @@ def read_private_state_bytes(path: Path) -> bytes | None:
             raise ValueError(
                 f"Runtime state file exceeds {MAX_PRIVATE_STATE_BYTES} bytes: {path}"
             )
-        _harden_private_state_file(fd, info, path)
+        if harden_permissions:
+            _harden_private_state_file(fd, info, path)
+        else:
+            _reject_unexpected_state_file_mode(info, path)
         handle = os.fdopen(fd, "rb")
         fd = -1
         with handle:
@@ -351,6 +386,23 @@ def read_private_state_bytes(path: Path) -> bytes | None:
     finally:
         if fd >= 0:
             os.close(fd)
+
+
+def _reject_unexpected_state_file_mode(info: os.stat_result, path: Path) -> None:
+    """Fail closed unless a file carries one of the modes this module writes."""
+
+    current_user_id = _current_posix_user_id()
+    if current_user_id is None:
+        return
+    if info.st_uid != current_user_id:
+        raise ValueError(
+            f"Runtime state file must be owned by the current user: {path}"
+        )
+    if stat.S_IMODE(info.st_mode) not in {
+        PRIVATE_STATE_FILE_MODE,
+        CONTAINER_READABLE_STATE_FILE_MODE,
+    }:
+        raise ValueError(f"Runtime state file has unexpected permissions: {path}")
 
 
 def _harden_private_state_file(fd: int, info: os.stat_result, path: Path) -> None:
